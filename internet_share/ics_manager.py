@@ -170,9 +170,13 @@ def enable_ics(source_name, target_name, log_callback=None):
     if success:
         _active_sharing["source"] = source_name
         _active_sharing["target"] = target_name
-        _active_sharing["method"] = "nat"
-        log("✓ Internet sharing active via direct NAT!")
-        return True, "Internet sharing is now active (NAT method)"
+        is_proxy = "Proxy" in message
+        _active_sharing["method"] = "proxy" if is_proxy else "nat"
+        if is_proxy:
+            log("✓ Internet sharing active via Python proxy!")
+        else:
+            log("✓ Internet sharing active via direct NAT!")
+        return True, f"Internet sharing is now active ({'proxy' if is_proxy else 'NAT method'})"
 
     return False, f"All methods failed. Last error: {message}"
 
