@@ -130,6 +130,10 @@ def run_diagnostics():
     if diag["is_admin"]:
         methods.append(("NAT (IP Forwarding)", "IP forwarding + static routing (no NAT kernel)"))
 
+    # Python proxy always works as long as we have admin for the network config
+    if diag["is_admin"]:
+        methods.append(("Python Proxy", "SOCKS5/HTTP/DNS proxy — works when all NAT is blocked"))
+
     if diag["hotspot_capable"]:
         methods.append(("Mobile Hotspot", "Windows Mobile Hotspot via WinRT API"))
 
