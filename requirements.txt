@@ -1,0 +1,7 @@
+# No external dependencies required — uses only Python standard library + Windows COM
+# The application uses:
+# - tkinter (built-in)
+# - subprocess (built-in) 
+# - ctypes (built-in)
+# - json (built-in)
+# All Windows ICS operations use PowerShell/COM via subprocess
