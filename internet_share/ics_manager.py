@@ -3,9 +3,10 @@ Internet Connection Sharing (ICS) Manager.
 Handles enabling/disabling internet sharing between network adapters.
 
 Methods (tried in order):
-1. Windows ICS via COM (HNetCfg.HNetShare) — blocked by Group Policy on most corp machines
+1. Windows ICS via COM (HNetCfg.HNetShare) — blocked by Group Policy or security software
 2. Registry override to temporarily bypass GP + ICS COM
-3. Direct NAT via New-NetNat + IP forwarding — bypasses ICS entirely (like Connectify)
+3. Direct NAT via New-NetNat + IP forwarding — needs Hyper-V/WinNat
+4. IP forwarding + Python proxy (SOCKS5/HTTP/DNS) — works on any machine
 """
 import subprocess
 import time
@@ -36,6 +37,7 @@ def _run_ps(command, timeout=30):
 
 # Track active sharing for cleanup
 _active_sharing = {"source": None, "target": None, "method": None}
+_proxy_instance = None  # Python proxy instance if running
 
 
 def _cleanup():
@@ -288,15 +290,16 @@ def _enable_nat_sharing(source_name, target_name, log):
     """
     Enable internet sharing using direct NAT + IP forwarding.
     Tries New-NetNat first; if that fails (WinNat driver issue),
-    falls back to IP forwarding + routing only.
+    falls back to IP forwarding + Python proxy for actual NAT.
 
     Steps:
     1. Assign static IP to target adapter (acts as gateway)
     2. Enable IP forwarding in the registry + per-interface
-    3. Try creating NetNat (kernel NAT)
-    4. If NetNat fails: use netsh routing / IP forwarding only
-    5. Configure DNS
+    3. Try creating NetNat (kernel NAT) — needs Hyper-V
+    4. If NetNat fails: start Python SOCKS5/HTTP/DNS proxy
+    5. Configure DNS + firewall rules
     """
+    global _proxy_instance
     safe_source = source_name.replace("'", "''")
     safe_target = target_name.replace("'", "''")
 
@@ -333,10 +336,8 @@ def _enable_nat_sharing(source_name, target_name, log):
     log("Enabling IP forwarding...")
     ps_step2 = f"""
     try {{
-        # Enable forwarding on source and target interfaces specifically
         Set-NetIPInterface -InterfaceAlias '{safe_source}' -Forwarding Enabled -ErrorAction SilentlyContinue
         Set-NetIPInterface -InterfaceAlias '{safe_target}' -Forwarding Enabled -ErrorAction SilentlyContinue
-        # Global registry key
         Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name 'IPEnableRouter' -Value 1 -Type DWord -Force
         Write-Output "SUCCESS"
     }} catch {{
@@ -348,34 +349,63 @@ def _enable_nat_sharing(source_name, target_name, log):
     if "STEP2_ERROR" in stdout:
         return False, f"Failed to enable IP forwarding: {stdout}"
 
-    # Step 3: Try NetNat first
+    # Step 3: Try kernel NAT methods
     nat_ok = False
-    log(f"Creating NAT rule '{NAT_NAME}' for {NAT_PREFIX}...")
+
+    # 3a: Try New-NetNat
+    log(f"Trying kernel NAT (New-NetNat)...")
     ps_step3 = f"""
     try {{
-        # Ensure WinNat driver is started
+        # Try to start WinNat via sc.exe (sometimes works when Start-Service doesn't)
         $winnat = Get-Service WinNat -ErrorAction SilentlyContinue
         if ($winnat -and $winnat.Status -ne 'Running') {{
-            Start-Service WinNat -ErrorAction Stop
+            sc.exe start WinNat 2>&1 | Out-Null
             Start-Sleep -Seconds 2
         }}
-        # Remove existing NAT with same name
         Remove-NetNat -Name '{NAT_NAME}' -Confirm:$false -ErrorAction SilentlyContinue
-        # Create new NAT
         New-NetNat -Name '{NAT_NAME}' -InternalIPInterfaceAddressPrefix '{NAT_PREFIX}' -ErrorAction Stop | Out-Null
         Write-Output "SUCCESS"
     }} catch {{
-        Write-Output "STEP3_ERROR: $($_.Exception.Message)"
+        Write-Output "NETNAT_FAIL: $($_.Exception.Message)"
     }}
     """
     stdout, stderr, rc = _run_ps(ps_step3, timeout=25)
     log(f"  NetNat: {stdout}")
-    if "SUCCESS" in stdout and "STEP3_ERROR" not in stdout:
+    if "SUCCESS" in stdout and "NETNAT_FAIL" not in stdout:
         nat_ok = True
-        log("  ✓ Kernel NAT (New-NetNat) active")
-    else:
-        log("  ⚠ New-NetNat failed — using IP forwarding only")
-        log("  Note: Devices must set this PC as their gateway manually")
+        log("  ✓ Kernel NAT (New-NetNat) active — full NAT routing")
+
+    # 3b: If NetNat failed, try RRAS NAT (netsh routing ip nat)
+    if not nat_ok:
+        log("  NetNat unavailable, trying RRAS NAT...")
+        ps_rras = f"""
+        try {{
+            # Enable and start RRAS
+            Set-Service RemoteAccess -StartupType Manual -ErrorAction SilentlyContinue
+            Start-Service RemoteAccess -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+
+            # Add NAT interfaces
+            netsh routing ip nat install 2>&1
+            netsh routing ip nat add interface name='{safe_source}' mode=full 2>&1
+            netsh routing ip nat add interface name='{safe_target}' mode=private 2>&1
+
+            # Check if it worked
+            $result = netsh routing ip nat show interface 2>&1
+            if ($result -match '{safe_source}') {{
+                Write-Output "SUCCESS"
+            }} else {{
+                Write-Output "RRAS_FAIL: NAT interfaces not configured"
+            }}
+        }} catch {{
+            Write-Output "RRAS_FAIL: $($_.Exception.Message)"
+        }}
+        """
+        stdout, stderr, rc = _run_ps(ps_rras, timeout=30)
+        log(f"  RRAS: {stdout}")
+        if "SUCCESS" in stdout and "RRAS_FAIL" not in stdout:
+            nat_ok = True
+            log("  ✓ RRAS NAT active — full NAT routing")
 
     # Step 4: Configure DNS on target adapter
     log("Configuring DNS on target adapter...")
@@ -391,34 +421,59 @@ def _enable_nat_sharing(source_name, target_name, log):
         Set-DnsClientServerAddress -InterfaceAlias '{safe_target}' -ServerAddresses $dns -ErrorAction SilentlyContinue
         Write-Output "SUCCESS"
     }} catch {{
-        Write-Output "STEP4_WARN: $($_.Exception.Message)"
+        Write-Output "DNS_WARN: $($_.Exception.Message)"
     }}
     """
     stdout, stderr, rc = _run_ps(ps_step4, timeout=15)
     log(f"  DNS: {stdout}")
 
-    # Step 5: If NetNat failed, set up Windows Firewall rules for forwarding
+    # Step 5: Set up firewall rules
+    log("Setting up firewall rules...")
+    ps_fw = f"""
+    try {{
+        # Remove old rules first
+        netsh advfirewall firewall delete rule name="InternetShare_Forward_In" 2>&1 | Out-Null
+        netsh advfirewall firewall delete rule name="InternetShare_Forward_Out" 2>&1 | Out-Null
+        netsh advfirewall firewall delete rule name="InternetShare_Proxy" 2>&1 | Out-Null
+
+        # Allow traffic from NAT subnet
+        netsh advfirewall firewall add rule name="InternetShare_Forward_In" dir=in action=allow protocol=any remoteip={NAT_PREFIX} 2>&1 | Out-Null
+        netsh advfirewall firewall add rule name="InternetShare_Forward_Out" dir=out action=allow protocol=any remoteip={NAT_PREFIX} 2>&1 | Out-Null
+
+        # Allow proxy ports (SOCKS5:1080, HTTP:8080, DNS:53)
+        netsh advfirewall firewall add rule name="InternetShare_Proxy" dir=in action=allow protocol=tcp localport=1080,8080 localip={NAT_GATEWAY} 2>&1 | Out-Null
+        netsh advfirewall firewall add rule name="InternetShare_Proxy" dir=in action=allow protocol=udp localport=53 localip={NAT_GATEWAY} 2>&1 | Out-Null
+
+        # Enable forwarding via netsh
+        netsh interface ipv4 set interface '{safe_source}' forwarding=enabled 2>&1 | Out-Null
+        netsh interface ipv4 set interface '{safe_target}' forwarding=enabled 2>&1 | Out-Null
+
+        Write-Output "SUCCESS"
+    }} catch {{
+        Write-Output "FW_WARN: $($_.Exception.Message)"
+    }}
+    """
+    stdout, stderr, rc = _run_ps(ps_fw, timeout=15)
+    log(f"  Firewall: {stdout}")
+
+    # Step 6: If no kernel NAT, start Python proxy
     if not nat_ok:
-        log("Setting up firewall rules for forwarding...")
-        ps_fw = f"""
-        try {{
-            # Allow forwarding in Windows Firewall
-            netsh advfirewall firewall add rule name="InternetShare_Forward_In" dir=in action=allow protocol=any remoteip={NAT_PREFIX} 2>&1 | Out-Null
-            netsh advfirewall firewall add rule name="InternetShare_Forward_Out" dir=out action=allow protocol=any remoteip={NAT_PREFIX} 2>&1 | Out-Null
+        log("")
+        log("⚠ No kernel NAT available (ICS blocked, NetNat failed, RRAS unavailable)")
+        log("Starting Python proxy for internet access...")
+        try:
+            from internet_share.proxy import NATProxy
+            _proxy_instance = NATProxy(listen_ip=NAT_GATEWAY, log_callback=log)
+            _proxy_instance.start()
+            time.sleep(1)
+            log("✓ Python proxy started:")
+            log(f"    DNS forwarder:  {NAT_GATEWAY}:53")
+            log(f"    SOCKS5 proxy:   {NAT_GATEWAY}:1080")
+            log(f"    HTTP proxy:     {NAT_GATEWAY}:8080")
+        except Exception as e:
+            log(f"  Proxy start error: {e}")
 
-            # Enable routing between interfaces using netsh
-            netsh interface ipv4 set interface '{safe_source}' forwarding=enabled 2>&1 | Out-Null
-            netsh interface ipv4 set interface '{safe_target}' forwarding=enabled 2>&1 | Out-Null
-
-            Write-Output "SUCCESS"
-        }} catch {{
-            Write-Output "FW_WARN: $($_.Exception.Message)"
-        }}
-        """
-        stdout, stderr, rc = _run_ps(ps_fw, timeout=15)
-        log(f"  Firewall: {stdout}")
-
-    # Step 6: Verify setup
+    # Step 7: Verify setup
     log("Verifying configuration...")
     ps_verify = f"""
     $ip = Get-NetIPAddress -InterfaceAlias '{safe_target}' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{NAT_GATEWAY}' }}
@@ -441,41 +496,64 @@ def _enable_nat_sharing(source_name, target_name, log):
     if "VERIFIED" in stdout:
         log("")
         log("=" * 50)
-        method_desc = "NAT sharing" if nat_ok else "IP forwarding"
-        log(f"{method_desc} is active!")
-        log(f"  Target adapter ({target_name}) gateway: {NAT_GATEWAY}")
-        log(f"  Connected devices should use:")
-        log(f"    IP:      {NAT_SUBNET}.x (e.g., {NAT_SUBNET}.2)")
-        log(f"    Subnet:  255.255.255.0")
-        log(f"    Gateway: {NAT_GATEWAY}")
-        log(f"    DNS:     8.8.8.8 / 8.8.4.4")
-        if not nat_ok:
-            log("")
-            log("  ⚠ NAT kernel not available — client must set")
-            log(f"    gateway={NAT_GATEWAY} and DNS manually.")
-            log("    DHCP won't assign these automatically.")
+        if nat_ok:
+            log("NAT sharing is active! (kernel NAT)")
+            log(f"  Connected devices should use:")
+            log(f"    IP:      {NAT_SUBNET}.x (e.g., {NAT_SUBNET}.2)")
+            log(f"    Subnet:  255.255.255.0")
+            log(f"    Gateway: {NAT_GATEWAY}")
+            log(f"    DNS:     8.8.8.8 / 8.8.4.4")
+        else:
+            log("Internet sharing via proxy is active!")
+            log(f"  Connected devices should use:")
+            log(f"    IP:      {NAT_SUBNET}.x (e.g., {NAT_SUBNET}.2)")
+            log(f"    Subnet:  255.255.255.0")
+            log(f"    Gateway: {NAT_GATEWAY}")
+            log(f"    DNS:     {NAT_GATEWAY} (proxied)")
+            log(f"")
+            log(f"  For full web access, configure browser proxy:")
+            log(f"    SOCKS5:  {NAT_GATEWAY}:1080")
+            log(f"    HTTP:    {NAT_GATEWAY}:8080")
+            log(f"")
+            log(f"  DNS works automatically (port 53 forwarded).")
+            log(f"  Direct IP connections (ping, etc.) need")
+            log(f"  kernel NAT which is not available.")
         log("=" * 50)
-        return True, f"{'NAT' if nat_ok else 'IP forwarding'} sharing active"
+        return True, f"{'NAT' if nat_ok else 'Proxy'} sharing active"
 
     return False, f"Setup verification failed: {stdout}"
 
 
 def _cleanup_nat(target_name, log=None):
-    """Remove NAT config and restore target adapter."""
+    """Remove NAT config, restore target adapter, and stop proxy."""
+    global _proxy_instance
     safe_target = target_name.replace("'", "''") if target_name else ""
 
     def _log(msg):
         if log:
             log(msg)
 
+    # Stop Python proxy
+    if _proxy_instance:
+        try:
+            _proxy_instance.stop()
+            _log("  Stopped Python proxy")
+        except Exception:
+            pass
+        _proxy_instance = None
+
     ps_script = f"""
     # Remove NetNat
     Remove-NetNat -Name '{NAT_NAME}' -Confirm:$false -ErrorAction SilentlyContinue
     Write-Output "Removed NAT rule"
 
+    # Remove RRAS NAT if configured
+    netsh routing ip nat uninstall 2>&1 | Out-Null
+
     # Remove firewall rules we created
     netsh advfirewall firewall delete rule name="InternetShare_Forward_In" 2>&1 | Out-Null
     netsh advfirewall firewall delete rule name="InternetShare_Forward_Out" 2>&1 | Out-Null
+    netsh advfirewall firewall delete rule name="InternetShare_Proxy" 2>&1 | Out-Null
     Write-Output "Removed firewall rules"
 
     # Restore target adapter to DHCP
