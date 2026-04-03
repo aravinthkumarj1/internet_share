@@ -286,14 +286,16 @@ def _enable_ics_registry_override(source_name, target_name, log):
 
 def _enable_nat_sharing(source_name, target_name, log):
     """
-    Enable internet sharing using direct NAT (New-NetNat) + IP forwarding.
-    This bypasses ICS entirely — similar to how Connectify works.
+    Enable internet sharing using direct NAT + IP forwarding.
+    Tries New-NetNat first; if that fails (WinNat driver issue),
+    falls back to IP forwarding + routing only.
 
     Steps:
     1. Assign static IP to target adapter (acts as gateway)
-    2. Enable IP forwarding in the registry
-    3. Create NetNat for the target subnet
-    4. Set up DNS forwarding via netsh
+    2. Enable IP forwarding in the registry + per-interface
+    3. Try creating NetNat (kernel NAT)
+    4. If NetNat fails: use netsh routing / IP forwarding only
+    5. Configure DNS
     """
     safe_source = source_name.replace("'", "''")
     safe_target = target_name.replace("'", "''")
@@ -327,61 +329,58 @@ def _enable_nat_sharing(source_name, target_name, log):
     if "STEP1_ERROR" in stdout:
         return False, f"Failed to assign static IP: {stdout}"
 
-    # Step 2: Enable IP forwarding
+    # Step 2: Enable IP forwarding (per-interface and globally)
     log("Enabling IP forwarding...")
-    ps_step2 = """
-    try {
-        # Enable forwarding on all interfaces
-        Set-NetIPInterface -Forwarding Enabled -ErrorAction SilentlyContinue
-        # Also set registry key for persistence
+    ps_step2 = f"""
+    try {{
+        # Enable forwarding on source and target interfaces specifically
+        Set-NetIPInterface -InterfaceAlias '{safe_source}' -Forwarding Enabled -ErrorAction SilentlyContinue
+        Set-NetIPInterface -InterfaceAlias '{safe_target}' -Forwarding Enabled -ErrorAction SilentlyContinue
+        # Global registry key
         Set-ItemProperty -Path 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name 'IPEnableRouter' -Value 1 -Type DWord -Force
         Write-Output "SUCCESS"
-    } catch {
+    }} catch {{
         Write-Output "STEP2_ERROR: $($_.Exception.Message)"
-    }
+    }}
     """
     stdout, stderr, rc = _run_ps(ps_step2, timeout=15)
     log(f"  IP forwarding: {stdout}")
     if "STEP2_ERROR" in stdout:
         return False, f"Failed to enable IP forwarding: {stdout}"
 
-    # Step 3: Create NetNat
+    # Step 3: Try NetNat first
+    nat_ok = False
     log(f"Creating NAT rule '{NAT_NAME}' for {NAT_PREFIX}...")
     ps_step3 = f"""
     try {{
+        # Ensure WinNat driver is started
+        $winnat = Get-Service WinNat -ErrorAction SilentlyContinue
+        if ($winnat -and $winnat.Status -ne 'Running') {{
+            Start-Service WinNat -ErrorAction Stop
+            Start-Sleep -Seconds 2
+        }}
         # Remove existing NAT with same name
         Remove-NetNat -Name '{NAT_NAME}' -Confirm:$false -ErrorAction SilentlyContinue
-
         # Create new NAT
         New-NetNat -Name '{NAT_NAME}' -InternalIPInterfaceAddressPrefix '{NAT_PREFIX}' -ErrorAction Stop | Out-Null
         Write-Output "SUCCESS"
     }} catch {{
-        # If "overlaps" error, try removing all NetNat first
-        if ($_.Exception.Message -like '*overlap*') {{
-            Write-Output "Removing overlapping NAT..."
-            Get-NetNat | Remove-NetNat -Confirm:$false -ErrorAction SilentlyContinue
-            try {{
-                New-NetNat -Name '{NAT_NAME}' -InternalIPInterfaceAddressPrefix '{NAT_PREFIX}' -ErrorAction Stop | Out-Null
-                Write-Output "SUCCESS"
-            }} catch {{
-                Write-Output "STEP3_ERROR: $($_.Exception.Message)"
-            }}
-        }} else {{
-            Write-Output "STEP3_ERROR: $($_.Exception.Message)"
-        }}
+        Write-Output "STEP3_ERROR: $($_.Exception.Message)"
     }}
     """
-    stdout, stderr, rc = _run_ps(ps_step3, timeout=20)
+    stdout, stderr, rc = _run_ps(ps_step3, timeout=25)
     log(f"  NetNat: {stdout}")
-    if "STEP3_ERROR" in stdout:
-        return False, f"Failed to create NAT: {stdout}"
+    if "SUCCESS" in stdout and "STEP3_ERROR" not in stdout:
+        nat_ok = True
+        log("  ✓ Kernel NAT (New-NetNat) active")
+    else:
+        log("  ⚠ New-NetNat failed — using IP forwarding only")
+        log("  Note: Devices must set this PC as their gateway manually")
 
-    # Step 4: Configure DNS forwarding on target adapter
+    # Step 4: Configure DNS on target adapter
     log("Configuring DNS on target adapter...")
-    # Get DNS servers from source adapter
     ps_step4 = f"""
     try {{
-        # Get DNS servers from source
         $dns = (Get-DnsClientServerAddress -InterfaceAlias '{safe_source}' -AddressFamily IPv4).ServerAddresses
         if (-not $dns -or $dns.Count -eq 0) {{
             $dns = @('8.8.8.8', '8.8.4.4')
@@ -389,54 +388,76 @@ def _enable_nat_sharing(source_name, target_name, log):
         }} else {{
             Write-Output "Source DNS: $($dns -join ', ')"
         }}
-
-        # Set DNS on target interface so clients can use it
         Set-DnsClientServerAddress -InterfaceAlias '{safe_target}' -ServerAddresses $dns -ErrorAction SilentlyContinue
-
         Write-Output "SUCCESS"
     }} catch {{
-        Write-Output "STEP4_ERROR: $($_.Exception.Message)"
+        Write-Output "STEP4_WARN: $($_.Exception.Message)"
     }}
     """
     stdout, stderr, rc = _run_ps(ps_step4, timeout=15)
     log(f"  DNS: {stdout}")
 
-    # Step 5: Verify NAT is active
-    log("Verifying NAT configuration...")
-    ps_verify = f"""
-    $nat = Get-NetNat -Name '{NAT_NAME}' -ErrorAction SilentlyContinue
-    $ip = Get-NetIPAddress -InterfaceAlias '{safe_target}' -AddressFamily IPv4 -ErrorAction SilentlyContinue
-    $fwd = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name 'IPEnableRouter').IPEnableRouter
+    # Step 5: If NetNat failed, set up Windows Firewall rules for forwarding
+    if not nat_ok:
+        log("Setting up firewall rules for forwarding...")
+        ps_fw = f"""
+        try {{
+            # Allow forwarding in Windows Firewall
+            netsh advfirewall firewall add rule name="InternetShare_Forward_In" dir=in action=allow protocol=any remoteip={NAT_PREFIX} 2>&1 | Out-Null
+            netsh advfirewall firewall add rule name="InternetShare_Forward_Out" dir=out action=allow protocol=any remoteip={NAT_PREFIX} 2>&1 | Out-Null
 
-    if ($nat -and $ip -and $fwd -eq 1) {{
-        Write-Output "NAT: $($nat.Name) [$($nat.InternalIPInterfaceAddressPrefix)]"
-        Write-Output "Gateway IP: $($ip.IPAddress)/$($ip.PrefixLength)"
-        Write-Output "IP Forwarding: Enabled"
+            # Enable routing between interfaces using netsh
+            netsh interface ipv4 set interface '{safe_source}' forwarding=enabled 2>&1 | Out-Null
+            netsh interface ipv4 set interface '{safe_target}' forwarding=enabled 2>&1 | Out-Null
+
+            Write-Output "SUCCESS"
+        }} catch {{
+            Write-Output "FW_WARN: $($_.Exception.Message)"
+        }}
+        """
+        stdout, stderr, rc = _run_ps(ps_fw, timeout=15)
+        log(f"  Firewall: {stdout}")
+
+    # Step 6: Verify setup
+    log("Verifying configuration...")
+    ps_verify = f"""
+    $ip = Get-NetIPAddress -InterfaceAlias '{safe_target}' -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {{ $_.IPAddress -eq '{NAT_GATEWAY}' }}
+    $fwd = (Get-ItemProperty 'HKLM:\\SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters' -Name 'IPEnableRouter' -ErrorAction SilentlyContinue).IPEnableRouter
+    $nat = Get-NetNat -Name '{NAT_NAME}' -ErrorAction SilentlyContinue
+
+    Write-Output "Gateway IP: $(if ($ip) {{ $ip.IPAddress + '/' + $ip.PrefixLength }} else {{ 'MISSING' }})"
+    Write-Output "IP Forwarding: $(if ($fwd -eq 1) {{ 'Enabled' }} else {{ 'Disabled' }})"
+    Write-Output "NetNat: $(if ($nat) {{ $nat.Name + ' [' + $nat.InternalIPInterfaceAddressPrefix + ']' }} else {{ 'Not active' }})"
+
+    if ($ip -and $fwd -eq 1) {{
         Write-Output "VERIFIED"
     }} else {{
-        Write-Output "NAT: $(if ($nat) {{ $nat.Name }} else {{ 'MISSING' }})"
-        Write-Output "IP: $(if ($ip) {{ $ip.IPAddress }} else {{ 'MISSING' }})"
-        Write-Output "Forwarding: $fwd"
         Write-Output "NOT_VERIFIED"
     }}
     """
     stdout, stderr, rc = _run_ps(ps_verify, timeout=15)
-    log(f"  Verify: {stdout}")
+    log(f"  {stdout}")
 
     if "VERIFIED" in stdout:
         log("")
         log("=" * 50)
-        log("NAT sharing is active!")
+        method_desc = "NAT sharing" if nat_ok else "IP forwarding"
+        log(f"{method_desc} is active!")
         log(f"  Target adapter ({target_name}) gateway: {NAT_GATEWAY}")
         log(f"  Connected devices should use:")
-        log(f"    IP: {NAT_SUBNET}.x (e.g., {NAT_SUBNET}.2)")
-        log(f"    Subnet: 255.255.255.0")
+        log(f"    IP:      {NAT_SUBNET}.x (e.g., {NAT_SUBNET}.2)")
+        log(f"    Subnet:  255.255.255.0")
         log(f"    Gateway: {NAT_GATEWAY}")
-        log(f"    DNS: 8.8.8.8 / 8.8.4.4")
+        log(f"    DNS:     8.8.8.8 / 8.8.4.4")
+        if not nat_ok:
+            log("")
+            log("  ⚠ NAT kernel not available — client must set")
+            log(f"    gateway={NAT_GATEWAY} and DNS manually.")
+            log("    DHCP won't assign these automatically.")
         log("=" * 50)
-        return True, "NAT sharing active"
+        return True, f"{'NAT' if nat_ok else 'IP forwarding'} sharing active"
 
-    return False, f"NAT verification failed: {stdout}"
+    return False, f"Setup verification failed: {stdout}"
 
 
 def _cleanup_nat(target_name, log=None):
@@ -451,6 +472,11 @@ def _cleanup_nat(target_name, log=None):
     # Remove NetNat
     Remove-NetNat -Name '{NAT_NAME}' -Confirm:$false -ErrorAction SilentlyContinue
     Write-Output "Removed NAT rule"
+
+    # Remove firewall rules we created
+    netsh advfirewall firewall delete rule name="InternetShare_Forward_In" 2>&1 | Out-Null
+    netsh advfirewall firewall delete rule name="InternetShare_Forward_Out" 2>&1 | Out-Null
+    Write-Output "Removed firewall rules"
 
     # Restore target adapter to DHCP
     if ('{safe_target}') {{
