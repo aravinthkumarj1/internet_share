@@ -17,7 +17,7 @@ from internet_share.network_utils import (
     get_adapter_display_name, check_ics_service, start_ics_service,
 )
 from internet_share.ics_manager import (
-    enable_ics, disable_sharing, verify_sharing, get_sharing_status,
+    enable_ics, disable_sharing, get_sharing_status,
     enable_mobile_hotspot, disable_mobile_hotspot,
 )
 
@@ -260,11 +260,6 @@ class InternetShareApp:
                 ok, msg = enable_ics(source["name"], target["name"], log_callback=self._log)
 
                 if ok:
-                    # Verify
-                    self._log("Verifying sharing status...")
-                    verified, details = verify_sharing(source["name"], target["name"])
-                    self._log(f"  Verification: {details[:200]}")
-
                     self.is_sharing = True
                     self.current_source = source["name"]
                     self.current_target = target["name"]
