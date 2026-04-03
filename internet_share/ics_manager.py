@@ -220,14 +220,17 @@ def _enable_ics_com(source_name, target_name, log):
     }}
     """
     stdout, stderr, rc = _run_ps(ps_script, timeout=30)
+    # Show adapter list (truncated) plus any error on separate line
     log(f"  COM: {stdout[:400]}")
-
-    if "SUCCESS" in stdout and "COM_ERROR" not in stdout:
-        return True, "ICS enabled via COM"
     error_msg = ""
     for line in stdout.split("\n"):
         if "COM_ERROR:" in line or "ERR:" in line:
             error_msg = line
+    if error_msg and error_msg not in stdout[:400]:
+        log(f"  {error_msg}")
+
+    if "SUCCESS" in stdout and "COM_ERROR" not in stdout:
+        return True, "ICS enabled via COM"
     return False, error_msg or "COM method failed"
 
 
@@ -593,8 +596,8 @@ def disable_sharing():
         ok, msg = disable_all_ics()
         results.append(f"ICS: {msg}")
 
-    # Clean up NAT if it was used
-    if method in ("nat", None):
+    # Clean up NAT/proxy if it was used
+    if method in ("nat", "proxy", None):
         _cleanup_nat(target)
         results.append("NAT: cleaned up")
 
